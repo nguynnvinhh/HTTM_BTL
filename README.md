@@ -1,4 +1,5 @@
 python 3.10
+================================
 pip install opencv-python ultralytics
 ================================
 tạo folder "input", "output" ko cần tạo
