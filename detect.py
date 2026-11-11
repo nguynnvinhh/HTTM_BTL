@@ -6,7 +6,7 @@ import time
 import threading
 from datetime import datetime
 from tkinter import (
-    Tk, StringVar, Label, Button, Radiobutton,
+    Tk, StringVar, BooleanVar, Label, Button, Radiobutton, Checkbutton,
     Frame, Scrollbar, Listbox, SINGLE, END, BOTH, LEFT, RIGHT, Y, X,
     messagebox, filedialog,
 )
@@ -117,6 +117,18 @@ def show_source_selector():
     for f in files:
         lb.insert(END, os.path.relpath(f))
 
+    # Tuy chon Machine Zone
+    enable_machine_var = BooleanVar(value=True)
+
+    def on_source_changed(*args):
+        # Mac dinh: camera thi BAT vung may, video/anh thi TAT de tranh vuong
+        if sel_var.get() == "__camera__":
+            enable_machine_var.set(True)
+        else:
+            enable_machine_var.set(False)
+
+    sel_var.trace_add("write", on_source_changed)
+
     def on_listbox_select(event):
         idxs = lb.curselection()
         if idxs:
@@ -156,7 +168,16 @@ def show_source_selector():
         font=("Helvetica", 9),
         padx=8,
     )
-    browse_btn.pack(pady=(4, 0))
+    browse_btn.pack(pady=(4, 2))
+
+    # Checkbox Machine Zone
+    chk_machine = Checkbutton(
+        root,
+        text="⚠️ Bật giám sát vùng máy (Machine Zone)",
+        variable=enable_machine_var,
+        font=("Helvetica", 9),
+    )
+    chk_machine.pack(pady=(2, 0))
 
     # --- Nut OK / Huy ---
     btn_frame = Frame(root, pady=10)
@@ -171,6 +192,7 @@ def show_source_selector():
                 messagebox.showerror("Loi", f"Khong tim thay file:\n{v}")
                 return
             chosen["value"] = v
+        chosen["enable_machine"] = enable_machine_var.get()
         root.destroy()
 
     def on_cancel():
@@ -208,10 +230,10 @@ def show_source_selector():
     root.protocol("WM_DELETE_WINDOW", on_cancel)
     root.mainloop()
 
-    return chosen["value"]
+    return chosen["value"], chosen.get("enable_machine", False)
 
 
-SOURCE_SELECTION = show_source_selector()
+SOURCE_SELECTION, ENABLE_MACHINE_ZONE = show_source_selector()
 if SOURCE_SELECTION == "CANCEL":
     raise SystemExit("Nguoi dung huy chon nguon dau vao.")
 
@@ -476,7 +498,7 @@ def on_audio_alert(reason, confidence=0.0):
 # =====================================================
 
 def process_frame(frame):
-    global danger_frames, _fps_prev_time, _fps_value
+    global danger_frames, _fps_prev_time, _fps_value, ENABLE_MACHINE_ZONE
 
     # ----- FPS -----
     now = time.monotonic()
@@ -493,8 +515,9 @@ def process_frame(frame):
 
     annotated = pose_result.plot(boxes=False)
 
-    # ----- Ve vung may len man hinh -----
-    draw_machine_region(annotated, frame)
+    # ----- Ve vung may len man hinh (neu bat) -----
+    if ENABLE_MACHINE_ZONE:
+        draw_machine_region(annotated, frame)
 
     # ----- Model phat hien nga -----
     fall_result = fall_model.predict(
@@ -586,19 +609,23 @@ def process_frame(frame):
                 2
             )
 
-    # ----- Canh bao co tay gan may -----
-    hand_risk = detect_hand_near_machine(
-        frame,
-        pose_result,
-        annotated
-    )
+    # ----- Canh bao co tay gan may (chi khi bat vung may) -----
+    if ENABLE_MACHINE_ZONE:
+        hand_risk = detect_hand_near_machine(
+            frame,
+            pose_result,
+            annotated
+        )
 
-    if hand_risk:
-        danger_frames += 1
+        if hand_risk:
+            danger_frames += 1
+        else:
+            danger_frames = 0
+
+        hand_alert = danger_frames >= ALERT_AFTER_FRAMES
     else:
         danger_frames = 0
-
-    hand_alert = danger_frames >= ALERT_AFTER_FRAMES
+        hand_alert = False
 
     # ----- Lay trang thai canh bao am thanh mot cach an toan -----
     with audio_alert_lock:
@@ -673,15 +700,18 @@ def process_frame(frame):
 
 
 def _draw_source_label(annotated, label: str):
-    """Hien thi ten nguon dau vao goc duoi trai."""
+    """Hien thi ten nguon dau vao goc duoi trai va trang thai Machine Zone."""
     h = annotated.shape[0]
+    mz_status = "ON" if ENABLE_MACHINE_ZONE else "OFF"
+    mz_color = (0, 165, 255) if ENABLE_MACHINE_ZONE else (180, 180, 180)
+    full_text = f"{label} | Machine Zone: {mz_status} (Phim M: bat/tat)"
     cv2.putText(
         annotated,
-        label,
-        (8, h - 10),
+        full_text,
+        (8, h - 12),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.5,
-        (200, 200, 200),
+        mz_color,
         1,
         cv2.LINE_AA,
     )
@@ -704,24 +734,30 @@ audio_monitor = None
 try:
     # ------- MO NGUON DAU VAO -------
     if IS_IMAGE:
-        # Anh don: xu ly 1 lan, hien thi va luu
+        # Anh don: xu ly va hien thi (co the nhan M de bat/tat vung may)
         print(f"[INFO] Che do anh: {SOURCE}")
         frame = cv2.imread(SOURCE)
         if frame is None:
             raise FileNotFoundError(f"Khong mo duoc anh: {SOURCE}")
 
-        output = process_frame(frame)
-        _draw_source_label(output, f"[IMAGE] {os.path.basename(SOURCE)}")
-
-        out_name = "out_" + os.path.basename(SOURCE)
-        out_path = os.path.join("output", out_name)
-        cv2.imwrite(out_path, output)
-        print(f"[INFO] Da luu ket qua: {out_path}")
-
         cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-        cv2.imshow(WINDOW_NAME, output)
-        print("Nhan phim bat ky de dong...")
-        cv2.waitKey(0)
+        print("Huong dan: Nhan 'M' de bat/tat vung may, nhan phim bat ky de dong va luu anh.")
+
+        while True:
+            output = process_frame(frame.copy())
+            _draw_source_label(output, f"[IMAGE] {os.path.basename(SOURCE)}")
+            cv2.imshow(WINDOW_NAME, output)
+            key = cv2.waitKey(0) & 0xFF
+            if key in (ord("m"), ord("M")):
+                ENABLE_MACHINE_ZONE = not ENABLE_MACHINE_ZONE
+                print(f"[INFO] Vung may: {'BAT' if ENABLE_MACHINE_ZONE else 'TAT'}")
+                continue
+            else:
+                out_name = "out_" + os.path.basename(SOURCE)
+                out_path = os.path.join("output", out_name)
+                cv2.imwrite(out_path, output)
+                print(f"[INFO] Da luu ket qua: {out_path}")
+                break
 
     elif IS_VIDEO:
         # Video file
@@ -745,7 +781,7 @@ try:
 
         cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(WINDOW_NAME, 1280, 720)
-        print("Nhan Q de thoat som.")
+        print("Phim tat: Nhan 'Q' de thoat, nhan 'M' de bat/tat vung may (Machine Zone).")
 
         while True:
             ret, frame = cap.read()
@@ -755,8 +791,13 @@ try:
             _draw_source_label(output, f"[VIDEO] {os.path.basename(SOURCE)}")
             writer.write(output)
             cv2.imshow(WINDOW_NAME, output)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
+
+            key = cv2.waitKey(1) & 0xFF
+            if key in (ord("q"), ord("Q")):
                 break
+            elif key in (ord("m"), ord("M")):
+                ENABLE_MACHINE_ZONE = not ENABLE_MACHINE_ZONE
+                print(f"[INFO] Vung may: {'BAT' if ENABLE_MACHINE_ZONE else 'TAT'}")
 
         cap.release()
         writer.release()
@@ -780,7 +821,7 @@ try:
         audio_monitor.start()
 
         print("Camera va audio dang khoi dong.")
-        print("Nhan Q de thoat.")
+        print("Phim tat: Nhan 'Q' de thoat, nhan 'M' de bat/tat vung may (Machine Zone).")
 
         while True:
             frame = camera.read()
@@ -794,8 +835,12 @@ try:
 
             cv2.imshow(WINDOW_NAME, output)
 
-            if cv2.waitKey(1) & 0xFF == ord("q"):
+            key = cv2.waitKey(1) & 0xFF
+            if key in (ord("q"), ord("Q")):
                 break
+            elif key in (ord("m"), ord("M")):
+                ENABLE_MACHINE_ZONE = not ENABLE_MACHINE_ZONE
+                print(f"[INFO] Vung may: {'BAT' if ENABLE_MACHINE_ZONE else 'TAT'}")
 
 except KeyboardInterrupt:
     print("Da dung chuong trinh.")

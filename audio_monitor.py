@@ -18,6 +18,7 @@ class AudioDistressMonitor:
         cooldown=8,
         scream_threshold=0.18,
         scream_duration=0.8,
+        device=None,
     ):
         self.model_path = model_path
         self.alert_callback = alert_callback
@@ -25,6 +26,7 @@ class AudioDistressMonitor:
         self.cooldown = cooldown
         self.scream_threshold = scream_threshold
         self.scream_duration = scream_duration
+        self.device = device
 
         self.audio_queue = queue.Queue(maxsize=40)
         self.stop_event = threading.Event()
@@ -40,7 +42,6 @@ class AudioDistressMonitor:
             "giúp với",
             "help me",
             "help",
-            "em đau",
             "đau quá",
         ]
 
@@ -126,14 +127,31 @@ class AudioDistressMonitor:
             if self.stop_event.is_set():
                 return
 
-            with sd.InputStream(
-                device=3,
-                samplerate=self.sample_rate,
-                channels=1,
-                dtype="float32",
-                blocksize=4000,
-                callback=self._audio_callback,
-            ):
+            def _create_stream(dev):
+                kwargs = {
+                    "samplerate": self.sample_rate,
+                    "channels": 1,
+                    "dtype": "float32",
+                    "blocksize": 4000,
+                    "callback": self._audio_callback,
+                }
+                if dev is not None:
+                    kwargs["device"] = dev
+                return sd.InputStream(**kwargs)
+
+            # Thu mo device duoc chi dinh (hoac device 3 neu de mac dinh), fallback ve None (thiet bi mac dinh cua OS)
+            stream = None
+            for dev in (self.device, 3, None):
+                try:
+                    stream = _create_stream(dev)
+                    break
+                except Exception:
+                    continue
+
+            if stream is None:
+                raise RuntimeError("Khong tim thay microphone hop le.")
+
+            with stream:
                 self._process_audio()
 
         except Exception as exc:

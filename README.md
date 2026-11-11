@@ -88,8 +88,11 @@ Khi khởi động, hộp thoại sẽ hiện lên để chọn nguồn đầu v
 | 📷 Camera trực tiếp | Dùng webcam (mặc định index 2) |
 | File video/ảnh | Chọn file có sẵn trong `input/` hoặc thư mục gốc |
 | Browse... | Duyệt chọn file bất kỳ trên máy |
+| ⚠️ Bật vùng máy | Tùy chọn bật/tắt Machine Zone (tự động tắt khi chọn video/ảnh để không bị vướng) |
 
-Nhấn **OK** để bắt đầu, **Q** để thoát cửa sổ detection.
+### Phím tắt trong lúc đang chạy:
+- **`Q`**: Thoát chương trình
+- **`M`**: Bật / Tắt nhanh khung **Machine Zone** và tính năng cảnh báo tay gần máy tức thì.
 
 ---
 
