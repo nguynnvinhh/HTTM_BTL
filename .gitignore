@@ -1,0 +1,16 @@
+# Bỏ qua môi trường ảo và cache python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.idea/
+
+# Bỏ qua các file trọng số AI nặng (tùy chọn lưu riêng trên Google Drive/Releases)
+*.pt
+
+# Bỏ qua dữ liệu đầu vào và kết quả sinh ra
+input/
+output/
+*.mp4
+*.avi
+*.part
