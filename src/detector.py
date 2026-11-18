@@ -19,6 +19,7 @@ class SafetyDetectorService:
     def __init__(self):
         self.model_fall_path = os.path.join("models", "best.pt")
         self.pose_backbone_path = os.path.join("models", "yolov8s-pose.pt")
+        self.model_machine_path = os.path.join("models", "machine.pt")
         self.vosk_model_path = os.path.join("models", "vosk-vn")
 
         for path in (self.model_fall_path, self.pose_backbone_path):
@@ -28,23 +29,33 @@ class SafetyDetectorService:
         self.fall_model = YOLO(self.model_fall_path)
         self.pose_model = YOLO(self.pose_backbone_path)
 
+        if os.path.isfile(self.model_machine_path):
+            self.machine_model = YOLO(self.model_machine_path)
+            print("[INFO] Da nap mo hinh nhan dien may moc: models/machine.pt")
+        else:
+            self.machine_model = None
+            print("[WARN] Chua tim thay models/machine.pt, tam dung vung may co dinh.")
+
         # Tham so nguong
         self.pose_conf = 0.30
         self.fall_conf = 0.45
-        self.wrist_conf = 0.25
+        self.machine_conf = 0.30
+        self.machine_margin = 25  # Vung dem an toan quanh may (pixel)
+        self.limb_conf = 0.25     # Nguong tin cay cho co tay & co chan
         self.alert_after_frames = 2
         self.fall_alert_after_frames = 5
         self.audio_alert_display_seconds = 6
 
         # Trang thai he thong
-        self.mode = "idle"          # "idle" | "camera" | "video" | "image"
+        self.mode = "idle"
         self.source_path = None
         self.source_label = "Chua chon nguon"
         self.enable_machine_zone = True
         self.preferred_camera_id = 1
 
         # Bien dem & FPS
-        self.danger_frames = 0
+        self.hand_danger_frames = 0
+        self.foot_danger_frames = 0
         self.fall_frames = 0
         self.fps_value = 0.0
         self._fps_prev_time = time.monotonic()
@@ -87,14 +98,8 @@ class SafetyDetectorService:
     def _render_placeholder(self, text: str):
         blank = np.zeros((540, 960, 3), dtype=np.uint8)
         cv2.putText(
-            blank,
-            text,
-            (40, 270),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.85,
-            (200, 200, 200),
-            2,
-            cv2.LINE_AA,
+            blank, text, (40, 270),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.85, (200, 200, 200), 2, cv2.LINE_AA
         )
         ok, buf = cv2.imencode(".jpg", blank)
         if ok:
@@ -186,7 +191,8 @@ class SafetyDetectorService:
         self.mode = "camera"
         self.source_label = f"Camera trực tiếp (Index {cam_id})"
         self.enable_machine_zone = True
-        self.danger_frames = 0
+        self.hand_danger_frames = 0
+        self.foot_danger_frames = 0
         self.fall_frames = 0
 
         if os.path.isdir(self.vosk_model_path):
@@ -209,8 +215,9 @@ class SafetyDetectorService:
         ext = os.path.splitext(filepath)[1].lower()
         filename = os.path.basename(filepath)
         self.source_path = filepath
-        self.enable_machine_zone = False
-        self.danger_frames = 0
+        self.enable_machine_zone = True
+        self.hand_danger_frames = 0
+        self.foot_danger_frames = 0
         self.fall_frames = 0
 
         if ext in IMAGE_EXTS:
@@ -261,9 +268,9 @@ class SafetyDetectorService:
             self.need_reprocess_image = True
         return self.enable_machine_zone
 
-    def _get_machine_region(self, frame):
+    def _get_fallback_machine_region(self, frame):
         h, w = frame.shape[:2]
-        return int(0.25 * w), int(0.30 * h), int(0.98 * w), int(0.68 * h)
+        return [(int(0.25 * w), int(0.30 * h), int(0.98 * w), int(0.68 * h), 1.0)]
 
     def _is_laying_by_geometry(self, keypoints, bbox):
         x1, y1, x2, y2 = bbox
@@ -295,19 +302,53 @@ class SafetyDetectorService:
         self.fps_value = 1.0 / max(now - self._fps_prev_time, 1e-6)
         self._fps_prev_time = now
 
+        frame_h, frame_w = frame.shape[:2]
+        frame_area = max(1, frame_h * frame_w)
+
+        # 1. Nhan dien khung xuong nguoi
         pose_result = self.pose_model.predict(
             source=frame, imgsz=416, conf=self.pose_conf, verbose=False
         )[0]
         annotated = pose_result.plot(boxes=False)
 
-        x1_m, y1_m, x2_m, y2_m = self._get_machine_region(frame)
-        if self.enable_machine_zone:
-            cv2.rectangle(annotated, (x1_m, y1_m), (x2_m, y2_m), (0, 165, 255), 2)
-            cv2.putText(
-                annotated, "Machine Zone", (x1_m + 4, y1_m + 20),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 165, 255), 1
-            )
+        person_boxes = []
+        if pose_result.boxes is not None:
+            for box in pose_result.boxes:
+                person_boxes.append(tuple(map(int, box.xyxy[0].cpu().tolist())))
 
+       # 2. Nhan dien may moc tu dong
+        machine_boxes = []
+        if self.enable_machine_zone:
+            if self.machine_model is not None:
+                machine_result = self.machine_model.predict(
+                    source=frame, imgsz=416, conf=self.machine_conf, verbose=False
+                )[0]
+                if machine_result.boxes is not None:
+                    for box in machine_result.boxes:
+                        mx1, my1, mx2, my2 = map(int, box.xyxy[0].cpu().tolist())
+                        m_conf = float(box.conf[0].item())
+                        m_area = max(1, (mx2 - mx1) * (my2 - my1))
+                        ratio = m_area / frame_area
+
+                        # Bo qua vat qua nho (< 3% anh nhu giay dep) va khung trum kin nen (> 85%)
+                        if 0.03 <= ratio <= 0.85:
+                            machine_boxes.append((mx1, my1, mx2, my2, m_conf))
+            else:
+                machine_boxes = self._get_fallback_machine_region(frame)
+
+            for mx1, my1, mx2, my2, m_conf in machine_boxes:
+                cv2.rectangle(annotated, (mx1, my1), (mx2, my2), (0, 165, 255), 2)
+                label_m = (
+                    f"Machine ({m_conf:.2f})"
+                    if self.machine_model is not None
+                    else "Machine Zone"
+                )
+                cv2.putText(
+                    annotated, label_m, (mx1 + 4, max(20, my1 - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 165, 255), 2
+                )
+
+        # 3. Nhan dien te nga
         fall_result = self.fall_model.predict(
             source=frame, imgsz=416, conf=self.fall_conf, verbose=False
         )[0]
@@ -361,33 +402,66 @@ class SafetyDetectorService:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2
                 )
 
-        # Kiem tra co tay gan vung may
+        # 4. Kiem tra ca CO TAY (9, 10) va CO CHAN (15, 16) xam nhap vung may
         hand_risk = False
-        if self.enable_machine_zone and pose_result.keypoints is not None:
+        foot_risk = False
+        if self.enable_machine_zone and machine_boxes and pose_result.keypoints is not None:
+            margin = self.machine_margin if self.machine_model is not None else 0
             for p_idx in range(len(pose_result.keypoints)):
                 pts = pose_result.keypoints[p_idx].data[0].cpu().numpy()
+
+                # Kiem tra co tay (9: trai, 10: phai)
                 for w_idx in (9, 10):
-                    px_f, py_f, w_conf = pts[w_idx][:3]
-                    if w_conf >= self.wrist_conf:
+                    px_f, py_f, conf = pts[w_idx][:3]
+                    if conf >= self.limb_conf:
                         px, py = int(px_f), int(py_f)
-                        if x1_m <= px <= x2_m and y1_m <= py <= y2_m:
+                        in_zone = any(
+                            (mx1 - margin) <= px <= (mx2 + margin)
+                            and (my1 - margin) <= py <= (my2 + margin)
+                            for mx1, my1, mx2, my2, _ in machine_boxes
+                        )
+                        if in_zone:
                             hand_risk = True
-                            cv2.circle(annotated, (px, py), 12, (0, 0, 255), -1)
+                            cv2.circle(annotated, (px, py), 10, (0, 0, 255), -1)
                             cv2.putText(
                                 annotated, "WRIST NEAR MACHINE",
-                                (max(5, px - 150), max(25, py - 20)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2
+                                (max(5, px - 110), max(25, py - 15)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2
+                            )
+
+                # Kiem tra co chan / ban chan (15: trai, 16: phai)
+                for a_idx in (15, 16):
+                    px_f, py_f, conf = pts[a_idx][:3]
+                    if conf >= self.limb_conf:
+                        px, py = int(px_f), int(py_f)
+                        in_zone = any(
+                            (mx1 - margin) <= px <= (mx2 + margin)
+                            and (my1 - margin) <= py <= (my2 + margin)
+                            for mx1, my1, mx2, my2, _ in machine_boxes
+                        )
+                        if in_zone:
+                            foot_risk = True
+                            cv2.circle(annotated, (px, py), 10, (0, 100, 255), -1)
+                            cv2.putText(
+                                annotated, "FOOT NEAR MACHINE",
+                                (max(5, px - 100), max(25, py - 15)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 100, 255), 2
                             )
 
         if self.enable_machine_zone:
             if is_static_image:
                 hand_alert = hand_risk
+                foot_alert = foot_risk
             else:
-                self.danger_frames = (self.danger_frames + 1) if hand_risk else 0
-                hand_alert = self.danger_frames >= self.alert_after_frames
+                self.hand_danger_frames = (self.hand_danger_frames + 1) if hand_risk else 0
+                self.foot_danger_frames = (self.foot_danger_frames + 1) if foot_risk else 0
+                hand_alert = self.hand_danger_frames >= self.alert_after_frames
+                foot_alert = self.foot_danger_frames >= self.alert_after_frames
         else:
-            self.danger_frames = 0
+            self.hand_danger_frames = 0
+            self.foot_danger_frames = 0
             hand_alert = False
+            foot_alert = False
 
         with self.audio_lock:
             sound_active = (
@@ -400,6 +474,9 @@ class SafetyDetectorService:
         if hand_alert:
             warnings.append("WARNING: HAND NEAR MACHINE")
             self.log_alert("HAND_NEAR_MACHINE", "Co tay xam nhap vung may")
+        if foot_alert:
+            warnings.append("WARNING: FOOT NEAR MACHINE")
+            self.log_alert("FOOT_NEAR_MACHINE", "Ban chan / co chan xam nhap vung may")
         if fall_detected:
             warnings.append("WARNING: FALL / LYING")
             self.log_alert("FALL_DETECTED", "Phat hien nguoi nga / nam san")
