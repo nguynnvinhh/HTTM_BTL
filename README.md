@@ -1,29 +1,33 @@
 ```text
 HTTM_BTL-main123/
-├── .gitignore
+├── app.py                  ← (file chạy chính - Backend FastAPI)
+├── requirements.txt
 ├── README.md
-├── app.py
+├── .gitignore
+│
+├── src/
+│   ├── __init__.py
+│   ├── audio_monitor.py
+│   ├── camera_input.py
+│   └── detector.py
+│
 ├── frontend/
+│   ├── index.html
+│   ├── vite.config.js
+│   ├── package.json
 │   ├── public/
 │   ├── src/
-│   │   ├── App.css
+│   │   ├── main.jsx        ← (entry point Frontend)
 │   │   ├── App.jsx
-│   │   ├── assets/
+│   │   ├── App.css
 │   │   ├── index.css
-│   │   └── main.jsx
-│   └── vite.config.js
-├── input/
-│   ├── .gitkeep
-│   ├── test.jpg
-│   └── video_test.mp4
+│   │   └── assets/
+│   └── node_modules/
+│
 ├── models/
-│   ├── best.pt
-│   └── yolov8s-pose.pt
-├── output
-├── requirements.txt
-└── src/
-    ├── __init__.py
-    ├── audio_monitor.py
-    ├── camera_input.py
-    └── detector.py
+│   └── vosk-vn/
+│
+├── input/
+│
+└── output/
 ```
