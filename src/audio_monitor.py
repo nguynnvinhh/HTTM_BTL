@@ -2,6 +2,7 @@ import json
 import queue
 import threading
 import time
+
 import numpy as np
 import sounddevice as sd
 from scipy.signal import butter, lfilter
@@ -9,17 +10,24 @@ from vosk import Model, KaldiRecognizer
 
 
 class AudioDistressMonitor:
+    """
+    Giám sát âm thanh kêu cứu & tiếng hét thời gian thực từ nhiều microphone.
+    Hỗ trợ chạy đồng thời cả micro Iriun và cả micro Laptop,
+    tự động bỏ qua thiết bị không khả dụng mà không làm gián đoạn luồng còn lại.
+    """
+
     def __init__(
         self,
         model_path="models/vosk-vn",
         alert_callback=None,
         sample_rate=16000,
-        cooldown=6,
-        scream_multiplier=3.0,     # Tiếng hét = RMS nhiễu nền x 3.0
-        min_scream_threshold=0.12,  # Ngưỡng RMS tối thiểu để coi là tiếng hét
-        scream_duration=0.5,       # Tiếng hét kéo dài trên 0.5s sẽ báo động
+        cooldown=6.0,
+        scream_multiplier=3.0,
+        min_scream_threshold=0.12,
+        scream_duration=0.5,
         device=None,
-        gain=2.5,                  # Hệ số khuếch đại âm thanh thu vào (Gain boost)
+        gain=2.5,
+        blocksize=4000,
     ):
         self.model_path = model_path
         self.alert_callback = alert_callback
@@ -28,22 +36,28 @@ class AudioDistressMonitor:
         self.scream_multiplier = scream_multiplier
         self.min_scream_threshold = min_scream_threshold
         self.scream_duration = scream_duration
-        self.device = device
         self.gain = gain
+        self.blocksize = blocksize
 
-        self.audio_queue = queue.Queue(maxsize=40)
+        # Hỗ trợ truyền 1 index (int), danh sách index ([4, 3]) hoặc None (mặc định)
+        if device is None:
+            self.devices = [None]
+        elif isinstance(device, (list, tuple, set)):
+            # Loại bỏ trùng lặp nhưng giữ nguyên thứ tự ưu tiên
+            seen = set()
+            self.devices = [d for d in device if not (d in seen or seen.add(d))]
+        else:
+            self.devices = [device]
+
         self.stop_event = threading.Event()
-        self.last_alert_time = 0.0
-        self.loud_duration = 0.0
         self.worker = None
+        self.streams = []
+        self.processing_threads = []
+        self.states = {}
 
-        # Độ ồn nền khởi tạo (Adaptive Noise Floor)
-        self.noise_floor = 0.02
-
-        # Khởi tạo bộ lọc High-Pass Butterworth
-        nyquist = 0.5 * self.sample_rate
-        normal_cutoff = 80.0 / nyquist
-        self.b_hp, self.a_hp = butter(1, normal_cutoff, btype="high", analog=False)
+        # Khóa chống báo động trùng giữa 2 microphone
+        self.alert_lock = threading.Lock()
+        self.last_alert_time = 0.0
 
         self.distress_phrases = [
             "cứu tôi",
@@ -58,159 +72,225 @@ class AudioDistressMonitor:
             "ngã rồi",
         ]
 
+        # Bộ lọc High-pass 80 Hz loại bỏ tiếng ù nền (quạt, động cơ)
+        nyquist = 0.5 * self.sample_rate
+        normal_cutoff = 80.0 / nyquist
+        self.b_hp, self.a_hp = butter(1, normal_cutoff, btype="high", analog=False)
+
+    def _create_device_state(self, device, name):
+        return {
+            "device": device,
+            "name": name,
+            "audio_queue": queue.Queue(maxsize=30),
+            "noise_floor": 0.02,
+            "loud_duration": 0.0,
+        }
+
+    def _audio_callback(self, source_id):
+        def callback(indata, frames, time_info, status):
+            if self.stop_event.is_set():
+                return
+
+            audio_queue = self.states[source_id]["audio_queue"]
+            chunk = indata.copy()
+            try:
+                audio_queue.put_nowait(chunk)
+            except queue.Full:
+                # Đẩy gói cũ nhất ra để ưu tiên dữ liệu âm thanh thời gian thực
+                try:
+                    audio_queue.get_nowait()
+                    audio_queue.put_nowait(chunk)
+                except (queue.Empty, queue.Full):
+                    pass
+
+        return callback
+
     def _apply_highpass_filter(self, signal):
-        """
-        Bộ lọc High-Pass Butterworth sử dụng SciPy (tốc độ cao).
-        Triệt tiêu các tần số thấp (< 80Hz) như tiếng ù máy móc, quạt thông gió.
-        """
         try:
             return lfilter(self.b_hp, self.a_hp, signal)
         except Exception:
             return signal
 
-    def _audio_callback(self, indata, frames, time_info, status):
-        try:
-            self.audio_queue.put_nowait(indata.copy())
-        except queue.Full:
-            pass
-
-    def _raise_alert(self, reason):
+    def _raise_alert(self, reason, source_name):
         now = time.monotonic()
-        if now - self.last_alert_time < self.cooldown:
-            return
+        with self.alert_lock:
+            if now - self.last_alert_time < self.cooldown:
+                return
+            self.last_alert_time = now
 
-        self.last_alert_time = now
-
-        print("\n" + "=" * 50)
-        print("[CANH BAO AM THANH]", reason)
-        print("=" * 50)
+        message = f"{source_name}: {reason}"
+        print("\n" + "=" * 55)
+        print("[CANH BAO AM THANH]", message)
+        print("=" * 55)
 
         if self.alert_callback:
             try:
-                self.alert_callback(reason, 0.0)
+                self.alert_callback(message, 0.0)
             except Exception as exc:
                 print("[AUDIO CALLBACK ERROR]", exc)
 
-    def _process_audio(self):
-        model = Model(self.model_path)
+    def _process_device(self, source_id, model):
+        state = self.states[source_id]
+        audio_queue = state["audio_queue"]
+        source_name = state["name"]
 
-        # GIẢI PHÁP TỐI ƯU VOSK:
-        # Ép mô hình chỉ tập trung nhận diện danh sách từ khóa + từ không xác định [unk]
-        # Giúp tăng tốc độ xử lý và tăng độ chính xác lên gấp nhiều lần trong môi trường nhiễu.
-        grammar_list = self.distress_phrases + ["[unk]"]
-        grammar_json = json.dumps(grammar_list, ensure_ascii=False)
+        grammar_json = json.dumps(self.distress_phrases + ["[unk]"], ensure_ascii=False)
         recognizer = KaldiRecognizer(model, self.sample_rate, grammar_json)
-
-        block_duration = 4000 / self.sample_rate
-        print("[AUDIO] Micro dang hoat dong voi bo loc am thanh toi uu.")
+        block_duration = self.blocksize / float(self.sample_rate)
 
         while not self.stop_event.is_set():
             try:
-                audio = self.audio_queue.get(timeout=0.2)
+                audio = audio_queue.get(timeout=0.2)
             except queue.Empty:
                 continue
 
-            mono = audio[:, 0]
+            try:
+                mono = np.mean(audio, axis=1) if audio.ndim == 2 else audio
+                mono = mono.astype(np.float32)
 
-            # 1. Khai thác & Lọc âm thanh (Nhanh với SciPy)
-            mono_filtered = self._apply_highpass_filter(mono)  # Lọc tiếng ù tần số thấp
-            mono_boosted = mono_filtered * self.gain            # Khuếch đại âm thanh
-            mono_clipped = np.clip(mono_boosted, -1.0, 1.0)     # Giới hạn tránh vỡ tiếng
+                # 1. Lọc tiếng ù tần số thấp + khuếch đại tín hiệu
+                filtered = self._apply_highpass_filter(mono)
+                clipped = np.clip(filtered * self.gain, -1.0, 1.0)
 
-            # 2. Xử lý Phát hiện Tiếng hét (RMS Adaptive)
-            rms = float(np.sqrt(np.mean(mono_clipped ** 2)))
+                # 2. Phát hiện tiếng hét / âm thanh lớn bất thường (Adaptive RMS)
+                rms = float(np.sqrt(np.mean(clipped ** 2)))
+                if rms < self.min_scream_threshold:
+                    state["noise_floor"] = 0.95 * state["noise_floor"] + 0.05 * rms
 
-            # Cập nhật tiếng ồn nền động (Adaptive Noise Floor)
-            if rms < self.min_scream_threshold:
-                self.noise_floor = 0.95 * self.noise_floor + 0.05 * rms
+                dynamic_threshold = max(
+                    self.min_scream_threshold,
+                    state["noise_floor"] * self.scream_multiplier,
+                )
 
-            # Ngưỡng hét linh hoạt theo môi trường thực tế
-            dynamic_scream_threshold = max(
-                self.min_scream_threshold,
-                self.noise_floor * self.scream_multiplier
-            )
+                if rms >= dynamic_threshold:
+                    state["loud_duration"] += block_duration
+                else:
+                    state["loud_duration"] = max(0.0, state["loud_duration"] - block_duration)
 
-            if rms >= dynamic_scream_threshold:
-                self.loud_duration += block_duration
-            else:
-                self.loud_duration = max(0.0, self.loud_duration - block_duration)
+                if state["loud_duration"] >= self.scream_duration:
+                    self._raise_alert(
+                        "Phat hien tieng het hoac am thanh lon keo dai",
+                        source_name,
+                    )
+                    state["loud_duration"] = 0.0
 
-            if self.loud_duration >= self.scream_duration:
-                self._raise_alert("Phat hien tieng het hoac am thanh lon keo dai")
-                self.loud_duration = 0.0
+                # 3. Nhận diện từ khóa kêu cứu tiếng Việt qua Vosk
+                pcm16 = (clipped * 32767).astype(np.int16)
+                if recognizer.AcceptWaveform(pcm16.tobytes()):
+                    recognized_text = json.loads(recognizer.Result()).get("text", "")
+                else:
+                    recognized_text = json.loads(recognizer.PartialResult()).get("partial", "")
 
-            # 3. Xử lý Nhận diện Từ khóa Lời nói (Speech-To-Text)
-            pcm16 = (mono_clipped * 32767).astype(np.int16)
-
-            recognized_text = ""
-
-            # Thử nhận diện câu hoàn chỉnh hoặc từ khóa tức thì
-            if recognizer.AcceptWaveform(pcm16.tobytes()):
-                result = json.loads(recognizer.Result())
-                recognized_text = result.get("text", "").lower().strip()
-            else:
-                partial_res = json.loads(recognizer.PartialResult())
-                recognized_text = partial_res.get("partial", "").lower().strip()
-
-            if recognized_text:
-                # Bỏ từ nhiễu không xác định [unk]
-                clean_text = recognized_text.replace("[unk]", "").strip()
-
+                clean_text = recognized_text.lower().replace("[unk]", "").strip()
                 if clean_text:
                     for phrase in self.distress_phrases:
                         if phrase in clean_text:
-                            self._raise_alert(f"Phat hien loi keu cuu: {phrase}")
-                            recognizer.Reset()  # Reset bộ nhận diện để không lặp lại từ vừa bắt
+                            self._raise_alert(f"Phat hien loi keu cuu: '{phrase}'", source_name)
+                            recognizer.Reset()
                             break
+
+            except Exception as exc:
+                print(f"[AUDIO PROCESS ERROR] {source_name}: {exc}")
+
+    def _open_single_device(self, source_id, device, model):
+        try:
+            if device is not None:
+                info = sd.query_devices(device, kind="input")
+                dev_name = info.get("name", f"Mic {device}")
+            else:
+                dev_name = "Default Microphone"
+
+            state = self._create_device_state(device, dev_name)
+            self.states[source_id] = state
+
+            stream = sd.InputStream(
+                device=device,
+                samplerate=self.sample_rate,
+                channels=1,
+                dtype="float32",
+                blocksize=self.blocksize,
+                callback=self._audio_callback(source_id),
+            )
+            stream.start()
+            self.streams.append(stream)
+
+            t = threading.Thread(
+                target=self._process_device,
+                args=(source_id, model),
+                daemon=True,
+            )
+            t.start()
+            self.processing_threads.append(t)
+            print(f"[AUDIO] Da ket noi micro: {dev_name} (Index {device})")
+            return True
+        except Exception as exc:
+            print(f"[AUDIO WARN] Bo qua micro index {device}: {exc}")
+            return False
 
     def _run(self):
         try:
-            if self.stop_event.is_set():
+            model = Model(self.model_path)
+            opened_count = 0
+
+            for idx, device in enumerate(self.devices):
+                if self.stop_event.is_set():
+                    break
+                if self._open_single_device(idx, device, model):
+                    opened_count += 1
+
+            # Nếu toàn bộ index chỉ định đều lỗi, tự động lùi về Micro mặc định của Windows
+            if opened_count == 0 and self.devices != [None]:
+                if self._open_single_device(99, None, model):
+                    opened_count += 1
+
+            if opened_count == 0:
+                print("[AUDIO ERROR] Khong tim thay microphone nao kha dung.")
                 return
 
-            def _create_stream(dev):
-                kwargs = {
-                    "samplerate": self.sample_rate,
-                    "channels": 1,
-                    "dtype": "float32",
-                    "blocksize": 4000,
-                    "callback": self._audio_callback,
-                }
-                if dev is not None:
-                    kwargs["device"] = dev
-                return sd.InputStream(**kwargs)
-
-            stream = None
-            # Thử với thiết bị yêu cầu, nếu thất bại sẽ dùng Micro mặc định
-            for dev in (self.device, None):
-                try:
-                    stream = _create_stream(dev)
-                    break
-                except Exception:
-                    continue
-
-            if stream is None:
-                raise RuntimeError("Khong tim thay microphone hop le.")
-
-            with stream:
-                self._process_audio()
-
+            while not self.stop_event.wait(0.2):
+                pass
         except Exception as exc:
             if not self.stop_event.is_set():
                 print("[AUDIO ERROR]", exc)
+        finally:
+            self._close_streams()
+
+    def _close_streams(self):
+        for stream in self.streams:
+            try:
+                stream.stop()
+                stream.close()
+            except Exception:
+                pass
+        self.streams.clear()
+
+        for thread in self.processing_threads:
+            if thread.is_alive():
+                thread.join(timeout=2.0)
+        self.processing_threads.clear()
 
     def start(self):
         if self.worker and self.worker.is_alive():
             return
 
         self.stop_event.clear()
-        self.worker = threading.Thread(
-            target=self._run,
-            daemon=True,
-        )
+        self.states.clear()
+        self.streams.clear()
+        self.processing_threads.clear()
+
+        self.worker = threading.Thread(target=self._run, daemon=True)
         self.worker.start()
 
     def stop(self):
         self.stop_event.set()
+        for stream in self.streams:
+            try:
+                stream.stop()
+            except Exception:
+                pass
+
         if self.worker and self.worker.is_alive():
-            self.worker.join(timeout=3)
+            self.worker.join(timeout=4.0)
+
+        self._close_streams()
+        print("[AUDIO] Da dung giam sat am thanh.")
